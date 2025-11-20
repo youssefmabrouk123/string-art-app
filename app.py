@@ -1,258 +1,430 @@
 import streamlit as st
 import numpy as np
 import cv2
-from PIL import Image, ImageOps
-from skimage.draw import line as skimage_line
+from PIL import Image, ImageOps, ImageDraw, ImageFilter
+import time
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Industrial String Art", layout="wide", page_icon="🧵")
+st.set_page_config(page_title="Pro String Art Studio V5", layout="wide", page_icon="🧵")
+
 st.markdown("""
 <style>
-    .stApp { background-color: #000000; color: #ffffff; }
-    .stButton>button { background-color: #ff4b4b; color: white; font-weight: bold; border: none; }
-    div[data-testid="stImage"] { border: 1px solid #333; }
+    .stApp { background-color: #0a0a0a; color: #eee; }
+    .stButton>button { background-color: #00cc66; color: white; font-weight: bold; border-radius: 8px; }
+    img { border: 1px solid #333; border-radius: 8px; }
+    .success-box { padding: 1rem; background: #1a3a1a; border-radius: 8px; border: 1px solid #00cc66; }
 </style>
 """, unsafe_allow_html=True)
 
-class IndustrialSolver:
-    def __init__(self, pil_image, num_pins=256, size=600):
+class StringArtProcessor:
+    def __init__(self, pil_image, num_pins=200, size=800):
         self.num_pins = num_pins
         self.size = size
         self.radius = (size // 2) - 5
         self.center = (size // 2, size // 2)
+        self.original_image = pil_image
+        self.line_cache = {}
         
-        # 1. PREPARE IMAGE (The "Map")
-        # Convert to Grayscale
-        img = pil_image.convert('L')
-        # Resize to calculation size
-        img = ImageOps.fit(img, (size, size), Image.Resampling.LANCZOS)
+    def preprocess_image(self, clahe_clip=2.0, clahe_grid=8, gamma=1.0, 
+                         blur_size=1, invert=False, edge_enhance=0.0):
+        """Advanced preprocessing for optimal string art results"""
+        # Convert to grayscale
+        img = self.original_image.convert('L')
         
-        # 2. TONE MAPPING (Critical for Faces)
-        # We clip the histogram to force the face to be the primary feature
-        img_arr = np.array(img)
+        # Resize with high-quality resampling - fit to circle
+        img = ImageOps.fit(img, (self.size, self.size), Image.Resampling.LANCZOS)
+        img_array = np.array(img, dtype=np.uint8)
+        
+        # Apply Gaussian blur to reduce noise
+        if blur_size > 0:
+            blur_k = blur_size * 2 + 1
+            img_array = cv2.GaussianBlur(img_array, (blur_k, blur_k), 0)
         
         # CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        # This is what makes eyes visible even if the photo is dark
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        img_arr = clahe.apply(img_arr)
+        # This is KEY for face details - enhances local contrast
+        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(clahe_grid, clahe_grid))
+        img_array = clahe.apply(img_array)
         
-        # Invert: We want "Darkness" to be High Value (255) because we subtract from it
-        self.target_image = 255 - img_arr
-        self.target_image = self.target_image.astype(np.float32)
+        # Gamma correction (< 1 = brighter midtones, > 1 = darker midtones)
+        if gamma != 1.0:
+            inv_gamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** inv_gamma) * 255 
+                              for i in np.arange(256)]).astype("uint8")
+            img_array = cv2.LUT(img_array, table)
         
-        # Mask Circle (Set outside to 0 so we don't draw there)
-        Y, X = np.ogrid[:size, :size]
-        dist = np.sqrt((X - self.center[0])**2 + (Y-self.center[1])**2)
-        self.target_image[dist > self.radius] = 0
-
-        # 3. PRE-CALCULATE PINS
+        # Edge enhancement (optional - helps define features)
+        if edge_enhance > 0:
+            edges = cv2.Canny(img_array, 50, 150)
+            edges = cv2.GaussianBlur(edges, (3, 3), 0)
+            img_array = cv2.addWeighted(img_array, 1.0, edges, -edge_enhance * 0.3, 0)
+        
+        # Invert if needed (dark thread on light background vs light thread on dark)
+        if invert:
+            img_array = 255 - img_array
+        
+        # Apply circular mask - CRITICAL: make outside WHITE (255)
+        # The algorithm seeks dark pixels, so white = ignored
+        mask = np.zeros((self.size, self.size), dtype=np.uint8)
+        cv2.circle(mask, self.center, self.radius, 255, -1)
+        
+        # Create output with white background
+        result = np.ones((self.size, self.size), dtype=np.uint8) * 255
+        result[mask == 255] = img_array[mask == 255]
+        
+        self.processed_img = result
+        return result
+    
+    def generate_pins(self):
+        """Generate evenly spaced pins around the circle"""
         self.pins = []
-        for i in range(num_pins):
-            angle = 2 * np.pi * i / num_pins - np.pi/2
+        for i in range(self.num_pins):
+            angle = 2 * np.pi * i / self.num_pins - (np.pi / 2)
             x = int(self.center[0] + self.radius * np.cos(angle))
             y = int(self.center[1] + self.radius * np.sin(angle))
             self.pins.append((x, y))
-            
-        # 4. PRE-CALCULATE LINES (The Speed Hack)
-        # We store the pixel coordinates of every possible line to avoid re-calculating
-        # This uses memory but makes the loop 50x faster.
-        self.line_cache = {}
-
-    def get_line_coords(self, p1_idx, p2_idx):
-        """Returns the cached coordinates between two pins"""
-        # Sort indices to ensure (1,5) is same as (5,1)
-        key = tuple(sorted((p1_idx, p2_idx)))
+        return self.pins
+    
+    def get_line_pixels(self, pin_a, pin_b):
+        """Get all pixels along a line using Bresenham - with caching"""
+        cache_key = (min(pin_a, pin_b), max(pin_a, pin_b))
+        if cache_key in self.line_cache:
+            return self.line_cache[cache_key]
         
-        if key not in self.line_cache:
-            p1 = self.pins[key[0]]
-            p2 = self.pins[key[1]]
-            rr, cc = skimage_line(p1[1], p1[0], p2[1], p2[0])
-            self.line_cache[key] = (rr, cc)
-            
-        return self.line_cache[key]
-
-    def solve(self, max_lines=3000, dark_weight=20):
+        p0, p1 = self.pins[pin_a], self.pins[pin_b]
+        
+        # Bresenham's line algorithm for accurate pixel coverage
+        x0, y0 = p0
+        x1, y1 = p1
+        
+        pixels = []
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        
+        while True:
+            if 0 <= x0 < self.size and 0 <= y0 < self.size:
+                pixels.append((y0, x0))  # Note: (row, col) for numpy
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+        
+        self.line_cache[cache_key] = pixels
+        return pixels
+    
+    def solve(self, max_lines=3000, line_weight=20, min_distance=0.1, 
+              early_stop_threshold=0.5, progress_callback=None):
         """
-        The Solver: NO RANDOMNESS. FULL SCAN.
+        Main solving algorithm - greedy approach with squared error minimization
+        
+        Key insight: We want to minimize (target - current)^2
+        Adding a line reduces error if the line passes through dark areas
         """
-        sequence = [0]
+        self.generate_pins()
+        
+        # Pre-cache all valid lines
+        min_pin_dist = int(self.num_pins * min_distance)
+        
+        # Target image: INVERT so dark=high value (what we want to cover)
+        # 0 = white (ignore), 255 = black (cover with strings)
+        target = (255.0 - self.processed_img.astype(np.float32))
+        
+        # Error/residual matrix - starts as target, we subtract as we add strings
+        residual = target.copy()
+        
+        # Track our result (starts white = 255, gets darker)
+        canvas = np.ones((self.size, self.size), dtype=np.float32) * 255.0
+        
+        sequence = [0]  # Start at pin 0
         current_pin = 0
         
-        # We keep track of the "Current Canvas" to show the user
-        # But mathematically we subtract from self.target_image
+        # For early stopping
+        prev_total_error = np.sum(residual ** 2)
+        stall_count = 0
         
-        bar = st.progress(0)
+        progress_bar = st.progress(0)
         status = st.empty()
-        
-        # Skip neighbors (too short)
-        MIN_DIST = 15
-        
-        # PRE-CACHE OPTIMIZATION
-        # Only cache lines we actually use to save RAM
         
         for step in range(max_lines):
             best_pin = -1
-            best_score = -1.0
+            best_score = -np.inf
             
-            # 1. DEFINE SEARCH SPACE
-            # We check ALL pins that are not neighbors
-            # NO RANDOM SAMPLING.
-            candidates = []
-            for i in range(self.num_pins):
-                d = abs(i - current_pin)
-                if d > MIN_DIST and d < (self.num_pins - MIN_DIST):
-                    candidates.append(i)
-            
-            # 2. EVALUATE CANDIDATES
-            # This is the heavy lifting
-            for target in candidates:
-                # Get pixels
-                rr, cc = self.get_line_coords(current_pin, target)
+            # Check all valid destination pins
+            for candidate in range(self.num_pins):
+                # Skip pins too close (creates short ugly lines)
+                dist = abs(candidate - current_pin)
+                dist = min(dist, self.num_pins - dist)  # Wrap around
                 
-                # Safety check for bounds
-                if len(rr) == 0: continue
-                rr = np.clip(rr, 0, self.size - 1)
-                cc = np.clip(cc, 0, self.size - 1)
+                if dist < min_pin_dist:
+                    continue
                 
-                # Score = Sum of remaining darkness along the line
-                # We prioritize the line that covers the MOST dark pixels
-                line_sum = np.sum(self.target_image[rr, cc])
+                # Get line pixels
+                pixels = self.get_line_pixels(current_pin, candidate)
+                if len(pixels) < 10:
+                    continue
                 
-                # Normalize by length (optional, but usually better for faces)
-                # Taking average density
-                score = line_sum / (len(rr) + 1)
+                # Calculate score: sum of residual values along line
+                # Higher residual = darker area that needs coverage
+                score = sum(residual[p[0], p[1]] for p in pixels)
+                
+                # Normalize by length (prefer longer lines that cover more)
+                score = score / np.sqrt(len(pixels))
                 
                 if score > best_score:
                     best_score = score
-                    best_pin = target
+                    best_pin = candidate
             
-            # Stop if no good line found
-            if best_pin == -1:
+            if best_pin == -1 or best_score <= 0:
+                status.text(f"Stopping early at line {step} - no improvement possible")
                 break
-                
-            # 3. COMMIT MOVE
+            
+            # Apply the selected line
             sequence.append(best_pin)
+            pixels = self.get_line_pixels(current_pin, best_pin)
             
-            # 4. SUBTRACT DARKNESS (Error Diffusion)
-            rr, cc = self.get_line_coords(current_pin, best_pin)
-            rr = np.clip(rr, 0, self.size - 1)
-            cc = np.clip(cc, 0, self.size - 1)
-            
-            # We remove the darkness. 
-            # Using a fixed weight prevents "over-burning" lines
-            self.target_image[rr, cc] = np.maximum(0, self.target_image[rr, cc] - dark_weight)
+            # Update residual: subtract the "thread" contribution
+            for py, px in pixels:
+                residual[py, px] = max(0, residual[py, px] - line_weight)
+                canvas[py, px] = max(0, canvas[py, px] - line_weight * 0.3)
             
             current_pin = best_pin
             
+            # Progress updates
             if step % 50 == 0:
-                bar.progress(step / max_lines)
-                status.text(f"Computing Line {step}/{max_lines} | Best Score: {int(best_score)}")
-
-        bar.empty()
+                progress_bar.progress(min(step / max_lines, 1.0))
+                current_error = np.sum(residual ** 2)
+                improvement = (prev_total_error - current_error) / prev_total_error * 100
+                status.text(f"Line {step}/{max_lines} | Error reduction: {improvement:.1f}%")
+                
+                # Early stopping check
+                if improvement < early_stop_threshold and step > 500:
+                    stall_count += 1
+                    if stall_count > 3:
+                        status.text(f"Converged at line {step}")
+                        break
+                else:
+                    stall_count = 0
+                prev_total_error = current_error
+        
+        progress_bar.empty()
         status.empty()
+        
+        self.sequence = sequence
+        self.canvas = canvas
         return sequence
-
-    def render_preview(self, sequence):
-        """
-        Generates a 4K-quality render using anti-aliased lines
-        """
-        # Create large canvas for quality
-        scale = 2
-        w = self.size * scale
-        canvas = np.ones((w, w), dtype=np.uint8) * 255
-        
-        # Use OpenCV for fast line drawing
-        # We simulate transparency by drawing faint black lines
-        # and accumulating them.
-        
-        # We start with white canvas.
-        # We want lines to be black with alpha. 
-        # Since CV2 doesn't do alpha on single channel easily, we subtract value.
-        
-        line_intensity = 25 # 0-255, smaller = more transparent
-        
-        print("Rendering preview...")
-        
-        # Draw lines
-        for i in range(len(sequence) - 1):
-            p1 = self.pins[sequence[i]]
-            p2 = self.pins[sequence[i+1]]
-            
-            # Scale up
-            pt1 = (p1[0]*scale, p1[1]*scale)
-            pt2 = (p2[0]*scale, p2[1]*scale)
-            
-            # Draw line on a temp layer
-            # Use standard line
-            cv2.line(canvas, pt1, pt2, 0, 1, cv2.LINE_AA)
-            
-            # To simulate real density, we can't just draw black.
-            # We need "accumulated darkness".
-            # Actually, simply drawing thin black lines (1px) on a 2x canvas 
-            # creates a perfect dithered look.
-            
-        # Resize back down
-        preview = cv2.resize(canvas, (self.size, self.size), interpolation=cv2.INTER_AREA)
-        return preview
-
-    def create_svg(self, sequence):
-        header = f'<svg height="{self.size}mm" width="{self.size}mm" viewBox="0 0 {self.size} {self.size}" xmlns="http://www.w3.org/2000/svg">\n'
-        circle = f'<circle cx="{self.size/2}" cy="{self.size/2}" r="{self.radius}" stroke="#ccc" fill="none"/>\n'
-        
-        path_data = []
-        for p in sequence:
-            x, y = self.pins[p]
-            path_data.append(f"{x},{y}")
-            
-        polyline = f'<polyline points="{" ".join(path_data)}" fill="none" stroke="black" stroke-width="0.15" />\n'
-        return header + circle + polyline + '</svg>'
-
-# --- UI LOGIC ---
-
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    st.title("String Art Industrial")
-    st.caption("Brute-force Solver v1.0")
     
-    uploaded_file = st.file_uploader("Upload High-Contrast Portrait", type=['jpg', 'png', 'jpeg'])
+    def render_preview(self, line_alpha=25):
+        """Quick preview render"""
+        canvas = Image.new('L', (self.size, self.size), 255)
+        draw = ImageDraw.Draw(canvas, 'L')
+        
+        for i in range(len(self.sequence) - 1):
+            p0 = self.pins[self.sequence[i]]
+            p1 = self.pins[self.sequence[i + 1]]
+            # Accumulate darkness
+            draw.line([p0, p1], fill=max(0, 255 - line_alpha), width=1)
+        
+        return canvas
     
-    st.markdown("### Tuning")
-    num_pins = st.slider("Pins (Resolution)", 200, 300, 256)
-    max_lines = st.slider("Lines (Darkness)", 1000, 4000, 2500)
-    weight = st.slider("Thread Thickness", 10, 50, 25, help="Lower value = needs more lines to get dark.")
+    def render_realistic(self, thread_alpha=18, thread_width=1):
+        """High-quality realistic render with transparency blending"""
+        # Use 2x size for anti-aliasing
+        render_size = self.size * 2
+        
+        # RGBA canvas for proper alpha blending
+        canvas = Image.new('RGBA', (render_size, render_size), (255, 255, 255, 255))
+        draw = ImageDraw.Draw(canvas, 'RGBA')
+        
+        # Scale pins
+        scaled_pins = [(x * 2, y * 2) for x, y in self.pins]
+        
+        # Draw frame circle
+        cx, cy = self.center[0] * 2, self.center[1] * 2
+        rad = self.radius * 2
+        draw.ellipse((cx - rad - 5, cy - rad - 5, cx + rad + 5, cy + rad + 5), 
+                     outline=(180, 180, 180, 255), width=3)
+        
+        # Draw pins
+        pin_size = 4
+        for px, py in scaled_pins:
+            draw.ellipse((px - pin_size, py - pin_size, px + pin_size, py + pin_size),
+                        fill=(60, 60, 60, 255))
+        
+        # Draw strings with low alpha for realistic overlap
+        thread_color = (0, 0, 0, thread_alpha)
+        
+        for i in range(len(self.sequence) - 1):
+            p0 = scaled_pins[self.sequence[i]]
+            p1 = scaled_pins[self.sequence[i + 1]]
+            draw.line([p0, p1], fill=thread_color, width=thread_width * 2)
+        
+        # Downscale with anti-aliasing
+        canvas = canvas.resize((self.size, self.size), Image.Resampling.LANCZOS)
+        
+        # Convert to RGB
+        background = Image.new('RGB', canvas.size, (255, 255, 255))
+        background.paste(canvas, mask=canvas.split()[3])
+        
+        return background
     
-    run_btn = st.button("RUN SOLVER", use_container_width=True)
+    def create_svg(self):
+        """Create vector SVG for printing/cutting"""
+        svg = [
+            f'<svg width="{self.size}mm" height="{self.size}mm" '
+            f'viewBox="0 0 {self.size} {self.size}" xmlns="http://www.w3.org/2000/svg">',
+            f'<circle cx="{self.center[0]}" cy="{self.center[1]}" r="{self.radius}" '
+            f'stroke="#ccc" stroke-width="2" fill="white"/>',
+        ]
+        
+        # Draw pins
+        for i, (px, py) in enumerate(self.pins):
+            svg.append(f'<circle cx="{px}" cy="{py}" r="3" fill="#333" />')
+            # Pin numbers (optional, for guide)
+            if i % 10 == 0:
+                svg.append(f'<text x="{px}" y="{py-8}" font-size="8" '
+                          f'text-anchor="middle" fill="#666">{i}</text>')
+        
+        # Draw path
+        if len(self.sequence) > 1:
+            path_d = f'M {self.pins[self.sequence[0]][0]} {self.pins[self.sequence[0]][1]}'
+            for idx in self.sequence[1:]:
+                path_d += f' L {self.pins[idx][0]} {self.pins[idx][1]}'
+            
+            svg.append(f'<path d="{path_d}" fill="none" stroke="black" '
+                      f'stroke-width="0.3" stroke-opacity="0.7"/>')
+        
+        svg.append('</svg>')
+        return '\n'.join(svg)
+    
+    def create_instructions(self):
+        """Create human-readable winding instructions"""
+        lines = [
+            "STRING ART WINDING GUIDE",
+            "=" * 40,
+            f"Total Pins: {self.num_pins}",
+            f"Total Connections: {len(self.sequence) - 1}",
+            f"Frame Diameter: {self.radius * 2} units",
+            "",
+            "PIN SEQUENCE:",
+            "-" * 40,
+        ]
+        
+        # Group into sets of 10 for readability
+        for i in range(0, len(self.sequence), 10):
+            chunk = self.sequence[i:i+10]
+            lines.append(f"[{i+1:4d}] " + " → ".join(map(str, chunk)))
+        
+        return '\n'.join(lines)
 
-with col2:
-    if uploaded_file:
-        image = Image.open(uploaded_file)
-        solver = IndustrialSolver(image, num_pins=num_pins)
+
+# ============ STREAMLIT UI ============
+
+st.title("🧵 String Art Generator Pro V5")
+st.caption("Advanced algorithm with CLAHE preprocessing, Bresenham lines, and optimized greedy solver")
+
+# Layout
+col_upload, col_settings = st.columns([1, 1])
+col_preview, col_result = st.columns([1, 1])
+
+with col_upload:
+    st.subheader("📷 Upload Image")
+    uploaded = st.file_uploader("Choose a portrait photo", type=['jpg', 'jpeg', 'png', 'webp'])
+    
+    if uploaded:
+        image = Image.open(uploaded)
+        st.image(image, caption="Original", use_column_width=True)
+
+with col_settings:
+    st.subheader("⚙️ Settings")
+    
+    with st.expander("🎨 Image Preprocessing", expanded=True):
+        clahe_clip = st.slider("CLAHE Contrast", 1.0, 4.0, 2.5, 
+                               help="Adaptive contrast - higher = more detail")
+        gamma = st.slider("Gamma", 0.5, 2.0, 1.0, 
+                         help="< 1 = brighter, > 1 = darker")
+        blur = st.slider("Noise Reduction", 0, 3, 1)
+        invert = st.checkbox("Invert (for light thread on dark)", False)
+    
+    with st.expander("🔧 Algorithm Parameters", expanded=True):
+        num_pins = st.slider("Number of Pins", 100, 360, 200)
+        max_lines = st.slider("Maximum Lines", 1000, 5000, 3000)
+        line_weight = st.slider("Line Weight", 10, 40, 22, 
+                               help="How much each string 'darkens' the image")
+        min_dist = st.slider("Min Pin Distance", 0.05, 0.25, 0.12,
+                            help="Prevents short lines near edges")
+    
+    with st.expander("🖼️ Render Settings"):
+        thread_alpha = st.slider("Thread Opacity", 10, 40, 18)
+        render_size = st.selectbox("Output Size", [600, 800, 1000, 1200], index=1)
+
+    generate_btn = st.button("🚀 GENERATE STRING ART", use_container_width=True, type="primary")
+
+# Processing
+if uploaded and generate_btn:
+    with st.spinner("Processing..."):
+        # Initialize processor
+        processor = StringArtProcessor(image, num_pins=num_pins, size=render_size)
         
-        # Show the "Tone Mapped" Input
-        # This is CRITICAL. If this looks bad, the result looks bad.
-        debug_view = Image.fromarray((255 - solver.target_image).astype(np.uint8))
+        # Preprocess
+        with col_preview:
+            st.subheader("🔬 Preprocessing")
+            processed = processor.preprocess_image(
+                clahe_clip=clahe_clip,
+                gamma=gamma,
+                blur_size=blur,
+                invert=invert
+            )
+            st.image(processed, caption="Algorithm Input (what the solver sees)", 
+                    use_column_width=True)
+            st.info("👆 Dark areas = where strings will be placed")
         
-        with st.expander("View Algorithm Input (Tone Mapped)", expanded=True):
-            st.image(debug_view, caption="Algorithm Vision (White=Empty, Black=Target)", width=300)
-        
-        if run_btn:
-            with st.spinner("Computing full vector path..."):
-                # Run
-                sequence = solver.solve(max_lines=max_lines, dark_weight=weight)
-                
-                # Render
-                preview = solver.render_preview(sequence)
-                
-                st.success(f"Complete. {len(sequence)} steps.")
-                st.image(preview, caption="Final Output", use_column_width=True)
-                
-                # Downloads
-                svg = solver.create_svg(sequence)
-                txt = " -> ".join(map(str, sequence))
-                
-                c1, c2 = st.columns(2)
-                c1.download_button("Download SVG", svg, "output.svg")
-                c2.download_button("Download Guide", txt, "guide.txt")
-    else:
-        st.info("Upload a photo to begin.")
+        # Solve
+        with col_result:
+            st.subheader("🎨 Result")
+            sequence = processor.solve(
+                max_lines=max_lines,
+                line_weight=line_weight,
+                min_distance=min_dist
+            )
+            
+            # Render
+            result = processor.render_realistic(thread_alpha=thread_alpha)
+            st.image(result, caption=f"String Art ({len(sequence)-1} connections)", 
+                    use_column_width=True)
+            
+            # Downloads
+            st.markdown("### 📥 Downloads")
+            c1, c2, c3 = st.columns(3)
+            
+            # SVG
+            svg_data = processor.create_svg()
+            c1.download_button("📐 Vector (SVG)", svg_data, "string_art.svg", "image/svg+xml")
+            
+            # Instructions
+            txt_data = processor.create_instructions()
+            c2.download_button("📋 Guide (TXT)", txt_data, "winding_guide.txt", "text/plain")
+            
+            # PNG
+            from io import BytesIO
+            buf = BytesIO()
+            result.save(buf, format='PNG', quality=95)
+            c3.download_button("🖼️ Image (PNG)", buf.getvalue(), "string_art.png", "image/png")
+            
+            st.success(f"✅ Generated {len(sequence)-1} string connections across {num_pins} pins!")
+
+elif not uploaded:
+    with col_preview:
+        st.info("👈 Upload a portrait photo to begin")
+        st.markdown("""
+        **Tips for best results:**
+        - Use high-contrast portraits
+        - Face should fill most of the frame
+        - Good lighting with clear shadows
+        - Avoid busy backgrounds
+        """)
