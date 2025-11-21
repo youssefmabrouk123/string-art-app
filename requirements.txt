@@ -1,4 +1,6 @@
-streamlit
-numpy
-Pillow
-scikit-image
+streamlit>=1.38.0
+numpy>=1.24.0
+opencv-python-headless>=4.9.0   # use headless version on servers (no GUI dependencies)
+Pillow>=10.0.0
+numba>=0.60.0
+llvmlite>=0.43.0
