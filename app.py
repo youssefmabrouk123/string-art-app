@@ -1,126 +1,56 @@
 import streamlit as st
 import numpy as np
-from PIL import Image, ImageOps, ImageDraw
 import cv2
+from PIL import Image, ImageOps, ImageDraw
 from io import BytesIO
 
-st.set_page_config(page_title="Perfect String Art", layout="centered", page_icon="🧵")
+st.set_page_config(page_title="Perfect String Art", layout="wide", page_icon="🧵")
+st.title("🧵 Perfect String Art — Professional Generator")
 
-st.title("🧵 Perfect String Art — Finally Fixed Forever")
-st.caption("Tested on 1000+ portraits • Never black again • Petros Vrellis quality guaranteed")
 
-class PerfectStringArt:
-    def __init__(self, pins=260, size=650):
-        self.pins_count = pins
+# ---------------------------------------------------------
+# CORE STRING-ART ENGINE
+# ---------------------------------------------------------
+class StringArt:
+    def __init__(self, pins=260, size=700):
+        self.pins = pins
         self.size = size
-        self.radius = size // 2 - 15
+        self.radius = size // 2 - 10
         self.center = (size // 2, size // 2)
 
+    # Pin placement on circle
     def make_pins(self):
-        angles = np.linspace(0, 2*np.pi, self.pins_count, endpoint=False)
-        return [(
-            int(self.center[0] + self.radius * np.cos(a)),
-            int(self.center[1] + self.radius * np.sin(a))
-        ) for a in angles]
+        angles = np.linspace(0, 2*np.pi, self.pins, endpoint=False)
+        X = (self.center[0] + self.radius * np.cos(angles)).astype(int)
+        Y = (self.center[1] + self.radius * np.sin(angles)).astype(int)
+        return list(zip(X, Y))
 
+    # Image preprocessing: strong but smooth contrast + hair/face enhancement
     def preprocess(self, img):
         img = img.convert("L")
         img = ImageOps.fit(img, (self.size, self.size), Image.LANCZOS)
         arr = np.array(img)
 
-        # Strong but controlled contrast
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        # CLAHE makes eyes/hair extremely sharp
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6))
         arr = clahe.apply(arr)
-        
-        # Gentle brightness boost only
-        arr = np.clip(arr.astype(np.int16) + 20, 0, 255).astype(np.uint8)
-        
-        # INVERT: now dark areas = high values = need string
+
+        # Slight gamma boost (amazing difference)
+        arr = ((arr / 255.0) ** 0.8 * 255).astype(np.uint8)
+
+        # Invert into “darkness map”
         arr = 255 - arr
 
         # Circular mask
         mask = np.zeros_like(arr)
-        cv2.circle(mask, self.center, self.radius + 10, 255, -1)
-        arr = cv2.bitwise_and(arr, arr, mask=mask)
+        cv2.circle(mask, self.center, self.radius, 255, -1)
+        arr = cv2.bitwise_and(arr, mask)
 
-        self.source = arr.astype(np.float32)
-        self.original_dark = arr.copy()
+        self.target = arr.astype(np.float32)
+        self.work = arr.astype(np.float32)
 
-    def solve(self):
-        pins = self.make_pins()
-        work = self.source.copy()
-        canvas = np.full_like(work, 255.0)
-
-        sequence = [0]
-        current = 0
-
-        progress = st.progress(0)
-        status = st.empty()
-        preview = st.empty()
-
-        for line in range(1, 7500):
-            best_score = 0
-            best_pin = None
-            
-            # Dynamic darkness — starts strong, ends gentle
-            progress_factor = np.clip(line / 3000, 0, 1)
-            darkness = 180 - 80 * progress_factor**1.5   # 180 → ~50
-
-            min_dist = 20 + int(15 * (line > 3500))
-
-            # Search only reasonable candidates
-            for offset in range(15, self.pins_count//2):
-                for direction in [-1, 1]:
-                    cand = (current + direction * offset) % self.pins_count
-                    if min(abs(cand - current), self.pins_count - abs(cand - current)) < min_dist:
-                        continue
-
-                    # Fast line sampling using Bresenham
-                    x0, y0 = pins[current]
-                    x1, y1 = pins[cand]
-                    points = self.fast_line(x0, y0, x1, y1)
-                    if len(points) < 30: continue
-
-                    # Score with center weighting
-                    scores = [work[y,x] for y,x in points]
-                    if not scores: continue
-                    score = sum(scores) / len(scores)
-
-                    if score > best_score:
-                        best_score = score
-                        best_pin = cand
-                        best_points = points
-
-                    if score > 40:  # early good line → take it fast
-                        break
-                if best_score > 40: break
-
-            if best_pin is None or best_score < 8:
-                status.text(f"Finished perfectly at {line} lines")
-                break
-
-            # Subtract ONLY proportional to current darkness (CRUCIAL FIX)
-            for y, x in best_points:
-                subtract = min(darkness, work[y,x] * 0.9)  # never over-subtract
-                work[y,x] -= subtract
-                canvas[y,x] -= subtract / 4.8
-
-            sequence.append(best_pin)
-            current = best_pin
-
-            if line % 100 == 0:
-                progress.progress(min(line / 6000, 1.0))
-                status.text(f"Line {line:,} • Active darkness {darkness:.0f} • Score {best_score:.1f}")
-
-            if line % 800 == 0:
-                prev = np.clip(canvas, 0, 255).astype(np.uint8)
-                preview.image(prev, caption=f"Preview — {line} lines", use_column_width=True)
-
-        self.sequence = sequence
-        self.final_canvas = np.clip(canvas, 0, 255).astype(np.uint8)
-        progress.progress(1.0)
-
-    def fast_line(self, x0, y0, x1, y1):
+    # Fast Bresenham line
+    def line_points(self, x0, y0, x1, y1):
         points = []
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
@@ -128,10 +58,10 @@ class PerfectStringArt:
         sy = 1 if y0 < y1 else -1
         err = dx - dy
         while True:
-            if 0 <= x0 < self.size and 0 <= y0 < self.size:
-                points.append((y0, x0))
-            if x0 == x1 and y0 == y1: break
-            e2 = 2 * err
+            points.append((y0, x0))
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = err * 2
             if e2 > -dy:
                 err -= dy
                 x0 += sx
@@ -140,44 +70,100 @@ class PerfectStringArt:
                 y0 += sy
         return points
 
+    # Main solver
+    def solve(self, max_lines=7200):
+        pins = self.make_pins()
+        sequence = []
+        current = 0
+
+        # Canvas starts white
+        canvas = np.ones((self.size, self.size), dtype=np.float32) * 255
+
+        for n in range(max_lines):
+            best_pin = None
+            best_score = -1
+            best_points = None
+
+            # Dynamic darkness curve — avoids black face
+            darkness = 120 - 50 * (n / max_lines)
+
+            # Search for best line
+            for offset in range(15, self.pins // 2):
+                for direction in (1, -1):
+                    cand = (current + direction * offset) % self.pins
+                    x0, y0 = pins[current]
+                    x1, y1 = pins[cand]
+
+                    pts = self.line_points(x0, y0, x1, y1)
+                    vals = [self.work[y, x] for (y, x) in pts]
+
+                    score = np.mean(vals)
+                    if score > best_score:
+                        best_score = score
+                        best_pin = cand
+                        best_points = pts
+
+            # Stop if no meaningful improvement
+            if best_score < 4:
+                break
+
+            # Apply thread (VERY IMPORTANT: soft subtract)
+            for (y, x) in best_points:
+                subtract = min(darkness, self.work[y, x] * 0.85)
+                self.work[y, x] -= subtract
+                canvas[y, x] -= subtract / 6
+
+            sequence.append(best_pin)
+            current = best_pin
+
+            if (n + 1) % 300 == 0:
+                st.write(f"Lines: {n+1}")
+
+        self.sequence = sequence
+        self.canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+
+    # Final rendering using smooth alpha threads
     def render(self):
         scale = 4
-        big = Image.new("RGBA", (self.size*scale, self.size*scale), (255,255,255,255))
-        draw = ImageDraw.Draw(big)
-        big_pins = [(x*scale, y*scale) for x,y in self.make_pins()]
+        W = self.size * scale
+        result = Image.new("RGBA", (W, W), (255, 255, 255, 255))
+        draw = ImageDraw.Draw(result)
 
-        # Beautiful soft threads
-        for i in range(len(self.sequence)-1):
-            a = big_pins[self.sequence[i]]
-            b = big_pins[self.sequence[i+1]]
-            draw.line([a, b], fill=(0,0,0,24), width=6)
+        pins_big = [(x*scale, y*scale) for (x, y) in self.make_pins()]
 
-        final = big.resize((self.size, self.size), Image.LANCZOS)
-        bg = Image.new("RGB", final.size, (255,255,255))
-        bg.paste(final, mask=final.split()[3])
-        return bg
+        for i in range(len(self.sequence) - 1):
+            a = pins_big[self.sequence[i]]
+            b = pins_big[self.sequence[i + 1]]
+            draw.line([a, b], fill=(0, 0, 0, 28), width=5)
 
-# ========================= UI =========================
-uploaded = st.file_uploader("Upload your photo", ["jpg","jpeg","png","webp"])
+        out = result.resize((self.size, self.size), Image.LANCZOS)
+        white = Image.new("RGB", out.size, (255, 255, 255))
+        white.paste(out, mask=out.split()[3])
+        return white
+
+
+# ---------------------------------------------------------
+# STREAMLIT UI
+# ---------------------------------------------------------
+uploaded = st.file_uploader("Upload portrait", ["jpg", "jpeg", "png", "webp"])
 
 if uploaded:
     img = Image.open(uploaded)
     st.image(img, caption="Original", use_column_width=True)
 
-    if st.button("🧵 CREATE PERFECT STRING ART", type="primary", use_container_width=True):
-        with st.spinner("Creating masterpiece... (45-80 seconds)"):
-            art = PerfectStringArt(pins=260, size=650)
-            art.preprocess(img)
-            art.solve()
-            result = art.render()
+    if st.button("Generate Perfect String Art", type="primary"):
+        with st.spinner("Processing…"):
+            engine = StringArt(pins=260, size=700)
+            engine.preprocess(img)
+            engine.solve()
+            final = engine.render()
 
-            st.image(result, use_column_width=True)
-            
+            st.image(final, caption="String Art Result", use_column_width=True)
+
             buf = BytesIO()
-            result.save(buf, "PNG", quality=95)
-            st.download_button("🖼 Download Perfect Result", buf.getvalue(), "perfect_string_art.png", "image/png")
-            
-            st.success("Done! This is now truly perfect — never black again")
-            st.balloons()
+            final.save(buf, "PNG", quality=95)
+            st.download_button("Download PNG", buf.getvalue(),
+                               "string_art.png", "image/png")
+
 else:
-    st.info("Upload any portrait → get flawless string art instantly")
+    st.info("Upload a portrait to start.")
